@@ -6,18 +6,42 @@ from werkzeug.security import generate_password_hash, check_password_hash
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "change-this-development-key")
 
-# Create DB
+DB_NAME = "users.db"
+
+# Create or update DB schema
 def init_db():
-    conn = sqlite3.connect("users.db")
-    conn.execute('''
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+
+    cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE,
             password_hash TEXT
         )
     ''')
+
+    # Handle an older database created by the vulnerable version.
+    columns = [row[1] for row in cursor.execute("PRAGMA table_info(users)").fetchall()]
+
+    if "password_hash" not in columns:
+        cursor.execute("ALTER TABLE users ADD COLUMN password_hash TEXT")
+
+    if "password" in columns:
+        old_users = cursor.execute(
+            "SELECT id, password FROM users WHERE password_hash IS NULL"
+        ).fetchall()
+
+        for user_id, old_password in old_users:
+            if old_password is not None:
+                cursor.execute(
+                    "UPDATE users SET password_hash = ? WHERE id = ?",
+                    (generate_password_hash(old_password), user_id)
+                )
+
     conn.commit()
     conn.close()
+
 
 init_db()
 
@@ -39,7 +63,7 @@ def register():
 
         password_hash = generate_password_hash(password)
 
-        conn = sqlite3.connect("users.db")
+        conn = sqlite3.connect(DB_NAME)
         try:
             conn.execute(
                 "INSERT INTO users (username, password_hash) VALUES (?, ?)",
@@ -47,7 +71,6 @@ def register():
             )
             conn.commit()
         except sqlite3.IntegrityError:
-            conn.close()
             return "Username already exists", 409
         finally:
             conn.close()
@@ -67,14 +90,14 @@ def login():
         if session.get("login_attempts", 0) >= app.config["MAX_LOGIN_ATTEMPTS"]:
             return "Account temporarily locked. Try again later.", 429
 
-        conn = sqlite3.connect("users.db")
+        conn = sqlite3.connect(DB_NAME)
         result = conn.execute(
             "SELECT id, username, password_hash FROM users WHERE username = ?",
             (username,)
         ).fetchone()
         conn.close()
 
-        if result and check_password_hash(result[2], password):
+        if result and result[2] and check_password_hash(result[2], password):
             session.clear()
             session["user"] = result[1]
             return redirect("/dashboard")
