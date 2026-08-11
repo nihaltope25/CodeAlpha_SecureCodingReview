@@ -16,17 +16,20 @@ def init_db():
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE,
+            username TEXT,
+            password TEXT,
             password_hash TEXT
         )
     ''')
 
-    # Handle an older database created by the vulnerable version.
     columns = [row[1] for row in cursor.execute("PRAGMA table_info(users)").fetchall()]
 
+    # Add the secure password_hash column to an older database if necessary.
     if "password_hash" not in columns:
         cursor.execute("ALTER TABLE users ADD COLUMN password_hash TEXT")
+        columns.append("password_hash")
 
+    # Migrate passwords from the old vulnerable database to hashes.
     if "password" in columns:
         old_users = cursor.execute(
             "SELECT id, password FROM users WHERE password_hash IS NULL"
@@ -65,13 +68,20 @@ def register():
 
         conn = sqlite3.connect(DB_NAME)
         try:
+            # Check for an existing username before inserting.
+            existing = conn.execute(
+                "SELECT id FROM users WHERE username = ?",
+                (username,)
+            ).fetchone()
+
+            if existing:
+                return "Username already exists", 409
+
             conn.execute(
                 "INSERT INTO users (username, password_hash) VALUES (?, ?)",
                 (username, password_hash)
             )
             conn.commit()
-        except sqlite3.IntegrityError:
-            return "Username already exists", 409
         finally:
             conn.close()
 
@@ -86,21 +96,45 @@ def login():
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
 
-        # Basic brute-force protection for the current session
+        # Basic brute-force protection for the current session.
         if session.get("login_attempts", 0) >= app.config["MAX_LOGIN_ATTEMPTS"]:
             return "Account temporarily locked. Try again later.", 429
 
         conn = sqlite3.connect(DB_NAME)
         result = conn.execute(
-            "SELECT id, username, password_hash FROM users WHERE username = ?",
+            "SELECT id, username, password_hash, password FROM users WHERE username = ?",
             (username,)
         ).fetchone()
-        conn.close()
 
-        if result and result[2] and check_password_hash(result[2], password):
-            session.clear()
-            session["user"] = result[1]
-            return redirect("/dashboard")
+        if result:
+            user_id, stored_username, password_hash, legacy_password = result
+
+            # Normal secure login path.
+            valid_password = (
+                bool(password_hash) and check_password_hash(password_hash, password)
+            )
+
+            # Compatibility path for an old database record. If an old plain-text
+            # password still exists, verify it once and immediately replace it with
+            # a hash. This lets existing local databases continue to work.
+            if not valid_password and legacy_password is not None:
+                if password == legacy_password:
+                    password_hash = generate_password_hash(password)
+                    conn.execute(
+                        "UPDATE users SET password_hash = ?, password = NULL WHERE id = ?",
+                        (password_hash, user_id)
+                    )
+                    conn.commit()
+                    valid_password = True
+
+            conn.close()
+
+            if valid_password:
+                session.clear()
+                session["user"] = stored_username
+                return redirect("/dashboard")
+        else:
+            conn.close()
 
         session["login_attempts"] = session.get("login_attempts", 0) + 1
         return "Invalid Credentials", 401
