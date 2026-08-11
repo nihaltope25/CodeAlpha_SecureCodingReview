@@ -1,8 +1,10 @@
-from flask import Flask, render_template, request, redirect, session
+import os
 import sqlite3
+from flask import Flask, render_template, request, redirect, session
+from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
-app.secret_key = "super_secure_key"
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", "change-this-development-key")
 
 # Create DB
 def init_db():
@@ -10,70 +12,75 @@ def init_db():
     conn.execute('''
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT,
-            password TEXT
+            username TEXT UNIQUE,
+            password_hash TEXT
         )
     ''')
+    conn.commit()
     conn.close()
 
 init_db()
 
-app.config['MAX_LOGIN_ATTEMPTS'] = 5
+app.config["MAX_LOGIN_ATTEMPTS"] = 5
 
 @app.route("/")
 def home():
     return render_template("index.html")
 
-# ✅ SECURE REGISTER (Parameterized Query)
+# SECURE REGISTER: parameterized query + password hashing
 @app.route("/register", methods=["GET", "POST"])
 def register():
     if request.method == "POST":
-        username = request.form.get("username")
-        password = request.form.get("password")
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+
+        if not username or not password:
+            return "Username and password are required", 400
+
+        password_hash = generate_password_hash(password)
 
         conn = sqlite3.connect("users.db")
-
-        # ✅ SAFE QUERY
-        conn.execute(
-            "INSERT INTO users (username, password) VALUES (?, ?)",
-            (username, password)
-        )
-
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute(
+                "INSERT INTO users (username, password_hash) VALUES (?, ?)",
+                (username, password_hash)
+            )
+            conn.commit()
+        except sqlite3.IntegrityError:
+            conn.close()
+            return "Username already exists", 409
+        finally:
+            conn.close()
 
         return redirect("/login")
 
     return render_template("register.html")
 
-# ✅ SECURE LOGIN
+# SECURE LOGIN: parameterized query + hashed password verification
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
-        username = request.form.get("username")
-        password = request.form.get("password")
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
 
-        # 🔒 Brute-force protection
-        if 'login_attempts' in session and session['login_attempts'] >= app.config['MAX_LOGIN_ATTEMPTS']:
-            return "Account locked. Try later."
+        # Basic brute-force protection for the current session
+        if session.get("login_attempts", 0) >= app.config["MAX_LOGIN_ATTEMPTS"]:
+            return "Account temporarily locked. Try again later.", 429
 
         conn = sqlite3.connect("users.db")
-
-        # ✅ SAFE QUERY
         result = conn.execute(
-            "SELECT * FROM users WHERE username = ? AND password = ?",
-            (username, password)
+            "SELECT id, username, password_hash FROM users WHERE username = ?",
+            (username,)
         ).fetchone()
-
         conn.close()
 
-        if result:
-            session['user'] = username
-            session['login_attempts'] = 0
+        if result and check_password_hash(result[2], password):
+            session.clear()
+            session["user"] = result[1]
             return redirect("/dashboard")
-        else:
-            session['login_attempts'] = session.get('login_attempts', 0) + 1
-            return "Invalid Credentials"
+
+        session["login_attempts"] = session.get("login_attempts", 0) + 1
+        return "Invalid Credentials", 401
 
     return render_template("login.html")
 
@@ -90,4 +97,4 @@ def logout():
     return redirect("/")
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=False)
